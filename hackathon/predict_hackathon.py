@@ -14,6 +14,135 @@ from hackathon_api import Datapoint, Protein, SmallMolecule
 # ---------------------------------------------------------------------------
 # ---- Participants should modify these four functions ----------------------
 # ---------------------------------------------------------------------------
+def _read_lines(p: Path) -> list[str]:
+    if not p.exists():
+        return []
+    return p.read_text(errors="ignore").splitlines()
+
+def _write_lines(p: Path, lines: list[str]) -> None:
+    p.write_text("\n".join(lines))
+    
+def _diverse_subsample(lines: list[str], target: int) -> list[str]:
+    if not lines or len(lines) <= target:
+        return lines
+    is_fasta = any(l.startswith(">") for l in lines)
+    if is_fasta:
+        pairs, cur_h, cur_seq = [], None, []
+        for l in lines:
+            if l.startswith(">"):
+                if cur_h is not None:
+                    pairs.append((cur_h, "".join(cur_seq)))
+                cur_h, cur_seq = l, []
+            else:
+                cur_seq.append(l.strip())
+        if cur_h is not None:
+            pairs.append((cur_h, "".join(cur_seq)))
+        if len(pairs) <= target:
+            out = []
+            for h, s in pairs:
+                out.extend([h, s])
+            return out
+        stride = max(1, len(pairs) // target)
+        sampled = pairs[::stride][:target]
+        out = []
+        for h, s in sampled:
+            out.extend([h, s])
+        return out
+    else:
+        stride = max(1, len(lines) // target)
+        return lines[::stride][:target]
+
+def _make_subsample(msa_rel: str | None, root: Optional[Path], tag: str, target: int) -> str | None:
+    if msa_rel is None:
+        return None
+    src = Path(msa_rel)
+    if not src.is_absolute():
+        base = (root or Path(".")).resolve()
+        src = (base / msa_rel).resolve()
+    if not src.exists():
+        return msa_rel
+    sub = _diverse_subsample(_read_lines(src), target)
+    out = src.with_name(src.stem + f".{tag}.msa")
+    _write_lines(out, sub)
+    try:
+        return os.path.relpath(out, Path.cwd())
+    except Exception:
+        return str(out)
+
+def _get_models_in_dir(pred_dir: Path, datapoint_id: str) -> list[Path]:
+    return sorted(pred_dir.glob(f"{datapoint_id}_config_*_model_*.pdb"))
+
+def _load_structure(pdb_path: Path):
+    return PDBParser(QUIET=True).get_structure("m", str(pdb_path))
+
+def _heavy_atoms(structure):
+    for a in structure.get_atoms():
+        el = (a.element or "").upper()
+        if el and el != "H":
+            yield a
+
+def _atoms_of_chains(structure, ids: set[str]):
+    for ch in structure.get_chains():
+        if ch.id in ids:
+            for a in ch.get_atoms():
+                el = (a.element or "").upper()
+                if el and el != "H":
+                    yield a
+
+def _interface_score_complex(structure, ab_ids={"H","L"}, ag_ids={"A"}):
+    ab_atoms = list(_atoms_of_chains(structure, set(ab_ids)))
+    ag_atoms = list(_atoms_of_chains(structure, set(ag_ids)))
+    if not ab_atoms or not ag_atoms:
+        return (0.0, 0.0, 999)
+    ns = NeighborSearch(list(_heavy_atoms(structure)))
+    contacts, clashes = 0, 0
+    contact_cut, clash_cut = 4.5, 2.0
+    ag_set = set(ag_atoms)
+    for a in ab_atoms:
+        for b in ns.search(a.coord, contact_cut):
+            if b is a or b not in ag_set:
+                continue
+            d = calc_distance(a.get_vector(), b.get_vector())
+            clashes += int(d < clash_cut)
+            contacts += int(clash_cut <= d <= contact_cut)
+    # cheap buried SASA proxy (avoid expensive copies)
+    buried_sasa = 0.5 * contacts
+    return float(contacts), float(buried_sasa), int(clashes)
+
+def _interface_score_ligand(structure):
+    protein_atoms, ligand_atoms = [], []
+    for res in structure.get_residues():
+        het = res.id[0].strip()
+        if het == "":
+            for a in res.get_atoms():
+                el = (a.element or "").upper()
+                if el and el != "H":
+                    protein_atoms.append(a)
+        else:
+            if res.get_resname().strip() not in {"HOH","WAT"}:
+                for a in res.get_atoms():
+                    el = (a.element or "").upper()
+                    if el and el != "H":
+                        ligand_atoms.append(a)
+    if not protein_atoms or not ligand_atoms:
+        return (0.0, 0.0, 999)
+    ns = NeighborSearch(list(_heavy_atoms(structure)))
+    contacts, clashes = 0, 0
+    contact_cut, clash_cut = 4.0, 2.0
+    lig_set = set(ligand_atoms)
+    for a in protein_atoms:
+        for b in ns.search(a.coord, contact_cut):
+            if b is a or b not in lig_set:
+                continue
+            d = calc_distance(a.get_vector(), b.get_vector())
+            clashes += int(d < clash_cut)
+            contacts += int(clash_cut <= d <= contact_cut)
+    buried_sasa = 0.5 * contacts
+    return float(contacts), float(buried_sasa), int(clashes)
+
+def _composite_score(contacts: float, buried_sasa: float, clashes: int) -> float:
+    return contacts + 0.02 * buried_sasa - 3.0 * clashes
+
 
 def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_dict: dict, msa_dir: Optional[Path] = None) -> List[tuple[dict, List[str]]]:
     """
@@ -45,8 +174,23 @@ def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_di
     # will add contact constraints to the input_dict
 
     # Example: predict 5 structures
-    cli_args = ["--diffusion_samples", "5"]
-    return [(input_dict, cli_args)]
+    seeds = [17, 23, 29]
+    targets = [None, 256, 64]
+    configs: list[tuple[dict, list[str]]] = []
+    for tgt, seed in zip(targets, seeds):
+        variant = yaml.safe_load(yaml.safe_dump(input_dict))  # deep copy
+        if msa_dir is not None and tgt is not None:
+            for seq in variant.get("sequences", []):
+                if "protein" in seq:
+                    msa_rel = seq["protein"].get("msa")
+                    new_msa = _make_subsample(msa_rel, msa_dir, f"sub{tgt}", tgt)
+                    if new_msa:
+                        seq["protein"]["msa"] = new_msa
+        cli = ["--diffusion_samples", "6", "--seed", str(seed)]
+        configs.append((variant, cli))
+    return configs
+    #cli_args = ["--diffusion_samples", "5"]
+    #return [(input_dict, cli_args)]
 
 def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[SmallMolecule], input_dict: dict, msa_dir: Optional[Path] = None) -> List[tuple[dict, List[str]]]:
     """
@@ -77,8 +221,23 @@ def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[Sm
     # will add contact constraints to the input_dict
 
     # Example: predict 5 structures
-    cli_args = ["--diffusion_samples", "5"]
-    return [(input_dict, cli_args)]
+    seeds = [11, 13, 19]
+    targets = [None, 256, 64]
+    configs: list[tuple[dict, List[str]]] = []
+    for tgt, seed in zip(targets, seeds):
+        variant = yaml.safe_load(yaml.safe_dump(input_dict))
+        if msa_dir is not None and tgt is not None:
+            for seq in variant.get("sequences", []):
+                if "protein" in seq:
+                    msa_rel = seq["protein"].get("msa")
+                    new_msa = _make_subsample(msa_rel, msa_dir, f"sub{tgt}", tgt)
+                    if new_msa:
+                        seq["protein"]["msa"] = new_msa
+        cli = ["--diffusion_samples", "5", "--seed", str(seed)]
+        configs.append((variant, cli))
+    return configs
+    #cli_args = ["--diffusion_samples", "5"]
+    #return [(input_dict, cli_args)]
 
 def post_process_protein_complex(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
@@ -92,14 +251,42 @@ def post_process_protein_complex(datapoint: Datapoint, input_dicts: List[dict[st
         Sorted pdb file paths that should be used as your submission.
     """
     # Collect all PDBs from all configurations
-    all_pdbs = []
-    for prediction_dir in prediction_dirs:
-        config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
-        all_pdbs.extend(config_pdbs)
+    #all_pdbs = []
+    #for prediction_dir in prediction_dirs:
+    #    config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
+    #    all_pdbs.extend(config_pdbs)
 
-    # Sort all PDBs and return their paths
-    all_pdbs = sorted(all_pdbs)
-    return all_pdbs
+    ## Sort all PDBs and return their paths
+    #all_pdbs = sorted(all_pdbs)
+    #return all_pdbs
+    all_pdbs: list[Path] = []
+    for d in prediction_dirs:
+        all_pdbs.extend(_get_models_in_dir(d, datapoint.datapoint_id))
+    if not all_pdbs:
+        return []
+
+    # cheap prefilter by contacts
+    pre = []
+    for p in all_pdbs:
+        try:
+            s = _load_structure(p)
+            c, _, _ = _interface_score_complex(s)
+            pre.append((c, p))
+        except Exception:
+            pre.append((-1, p))
+    pre.sort(key=lambda x: x[0], reverse=True)
+    shortlist = [p for _, p in pre[:max(20, min(50, len(all_pdbs)))]]
+
+    scored = []
+    for p in shortlist:
+        try:
+            s = _load_structure(p)
+            c, b, cl = _interface_score_complex(s)
+            scored.append((_composite_score(c, b, cl), p))
+        except Exception:
+            scored.append((-1e9, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored]
 
 def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
@@ -113,14 +300,41 @@ def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str
         Sorted pdb file paths that should be used as your submission.
     """
     # Collect all PDBs from all configurations
-    all_pdbs = []
-    for prediction_dir in prediction_dirs:
-        config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
-        all_pdbs.extend(config_pdbs)
-    
-    # Sort all PDBs and return their paths
-    all_pdbs = sorted(all_pdbs)
-    return all_pdbs
+    #all_pdbs = []
+    #for prediction_dir in prediction_dirs:
+    #    config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
+    #    all_pdbs.extend(config_pdbs)
+    #
+    ## Sort all PDBs and return their paths
+    #all_pdbs = sorted(all_pdbs)
+    #return all_pdbs
+    all_pdbs: list[Path] = []
+    for d in prediction_dirs:
+        all_pdbs.extend(_get_models_in_dir(d, datapoint.datapoint_id))
+    if not all_pdbs:
+        return []
+
+    pre = []
+    for p in all_pdbs:
+        try:
+            s = _load_structure(p)
+            c, _, _ = _interface_score_ligand(s)
+            pre.append((c, p))
+        except Exception:
+            pre.append((-1, p))
+    pre.sort(key=lambda x: x[0], reverse=True)
+    shortlist = [p for _, p in pre[:max(20, min(50, len(all_pdbs)))]]
+
+    scored = []
+    for p in shortlist:
+        try:
+            s = _load_structure(p)
+            c, b, cl = _interface_score_ligand(s)
+            scored.append((_composite_score(c, b, cl), p))
+        except Exception:
+            scored.append((-1e9, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored]
 
 # -----------------------------------------------------------------------------
 # ---- End of participant section ---------------------------------------------
@@ -241,7 +455,6 @@ def _run_boltz_and_collect(datapoint) -> None:
             "--devices", "1",
             "--out_dir", str(out_dir),
             "--cache", cache,
-            "--no_kernels",
             "--output_format", "pdb",
         ]
         cmd = fixed + cli_args
